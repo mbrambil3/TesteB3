@@ -228,3 +228,109 @@ class GitHubService:
             "files_pushed": results,
             "errors": errors
         }
+
+    def push_bulk_via_tree(
+        self,
+        repo_name: str,
+        files: List[Dict],
+        commit_message: str,
+        branch: str = None,
+        progress_callback=None
+    ) -> Dict:
+        """
+        Envia TODOS os arquivos em um único commit atômico usando Git Tree API.
+        Extremamente mais rápido que push individual (1 commit vs N commits).
+        
+        files: [{"path": "...", "content": "...", "encoding": "utf-8"|"base64"}]
+        progress_callback: função opcional chamada com (etapa, atual, total)
+        """
+        from github import InputGitTreeElement
+        
+        try:
+            repo = self.user.get_repo(repo_name)
+            branch = branch or repo.default_branch
+            total = len(files)
+            
+            # 1) Obter o HEAD da branch
+            try:
+                ref = repo.get_git_ref(f"heads/{branch}")
+                base_sha = ref.object.sha
+                base_commit = repo.get_git_commit(base_sha)
+                base_tree_sha = base_commit.tree.sha
+            except GithubException as e:
+                # Branch vazia (repo recém criado sem auto_init) - criar commit inicial
+                if e.status == 409 or e.status == 404:
+                    base_tree_sha = None
+                    base_commit = None
+                else:
+                    raise
+            
+            # 2) Criar blob para cada arquivo
+            tree_elements = []
+            for idx, file_info in enumerate(files):
+                encoding = file_info.get("encoding", "utf-8")
+                content = file_info["content"]
+                
+                if encoding == "base64":
+                    blob = repo.create_git_blob(content=content, encoding="base64")
+                else:
+                    blob = repo.create_git_blob(content=content, encoding="utf-8")
+                
+                tree_elements.append(
+                    InputGitTreeElement(
+                        path=file_info["path"],
+                        mode="100644",
+                        type="blob",
+                        sha=blob.sha
+                    )
+                )
+                
+                if progress_callback and (idx + 1) % 10 == 0:
+                    progress_callback("uploading_blobs", idx + 1, total)
+            
+            if progress_callback:
+                progress_callback("uploading_blobs", total, total)
+                progress_callback("creating_tree", 0, total)
+            
+            # 3) Criar tree
+            if base_tree_sha:
+                base_tree = repo.get_git_tree(base_tree_sha)
+                new_tree = repo.create_git_tree(tree_elements, base_tree=base_tree)
+            else:
+                new_tree = repo.create_git_tree(tree_elements)
+            
+            if progress_callback:
+                progress_callback("creating_commit", 0, total)
+            
+            # 4) Criar commit
+            parents = [base_commit] if base_commit else []
+            new_commit = repo.create_git_commit(
+                message=commit_message,
+                tree=new_tree,
+                parents=parents
+            )
+            
+            # 5) Atualizar a referência da branch
+            if base_commit:
+                ref.edit(sha=new_commit.sha)
+            else:
+                repo.create_git_ref(ref=f"refs/heads/{branch}", sha=new_commit.sha)
+            
+            if progress_callback:
+                progress_callback("done", total, total)
+            
+            return {
+                "success": True,
+                "files_pushed": total,
+                "commit_sha": new_commit.sha,
+                "commit_url": f"https://github.com/{repo.full_name}/commit/{new_commit.sha}"
+            }
+        except GithubException as e:
+            logger.error(f"Erro no push bulk: {e}")
+            return {
+                "success": False,
+                "error": str(e.data.get("message", str(e))) if hasattr(e, 'data') else str(e)
+            }
+        except Exception as e:
+            logger.error(f"Erro inesperado no push bulk: {e}")
+            return {"success": False, "error": str(e)}

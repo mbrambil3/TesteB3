@@ -1,0 +1,16 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32">
+  <!-- Background circle -->
+  <circle cx="16" cy="16" r="15" fill="#10b981" stroke="#059669" stroke-width="1"/>
+  
+  <!-- Growth chart icon -->
+  <path d="M 8 20 L 12 16 L 16 18 L 20 12 L 24 14" 
+        stroke="white" 
+        stroke-width="2" 
+        fill="none" 
+        stroke-linecap="round" 
+        stroke-linejoin="round"/>
+  
+  <!-- Arrow up -->
+  <path d="M 20 12 L 24 8 L 24 14 Z" 
+        fill="white"/>
+</svg>

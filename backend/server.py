@@ -1004,130 +1004,163 @@ class GitHubPushProjectRequest(BaseModel):
 
 def get_project_files() -> List[Dict[str, str]]:
     """
-    Lê TODOS os arquivos do projeto para enviar ao GitHub
-    Exclui apenas diretórios de sistema/cache que não fazem parte do projeto
+    Lê TODOS os arquivos do projeto para enviar ao GitHub.
+    Arquivos de texto vão como utf-8, binários vão como base64.
+    Exclui apenas diretórios de sistema/cache que não fazem parte do projeto.
     """
     import os
+    import base64
     
     project_root = "/app"
     files = []
     
-    # APENAS diretórios de sistema/cache a ignorar (não fazem parte do projeto)
+    # APENAS diretórios de sistema/cache a ignorar
     ignore_dirs = {
         'node_modules', '__pycache__', '.git', '.emergent', 'venv', '.venv',
-        '.pytest_cache', '.mypy_cache', '.ruff_cache', '.cache'
+        '.pytest_cache', '.mypy_cache', '.ruff_cache', '.cache',
+        'build', 'dist', '.next', '.yarn'
     }
     
-    # Extensões binárias (não podem ser enviadas como texto)
-    binary_extensions = {
-        '.png', '.jpg', '.jpeg', '.gif', '.ico', '.svg', '.webp', '.bmp',
-        '.mp3', '.mp4', '.wav', '.avi', '.mov', '.webm',
-        '.zip', '.tar', '.gz', '.rar', '.7z',
-        '.exe', '.dll', '.so', '.dylib',
-        '.pdf', '.doc', '.docx', '.xls', '.xlsx', '.ppt', '.pptx',
-        '.ttf', '.woff', '.woff2', '.eot', '.otf',
-        '.pyc', '.pyo', '.class', '.o'
-    }
+    # Tamanho máximo por arquivo (100 MB é o limite do GitHub, usamos 25MB para segurança)
+    MAX_FILE_SIZE = 25 * 1024 * 1024
     
     for root, dirs, filenames in os.walk(project_root):
-        # Filtrar apenas diretórios de sistema
         dirs[:] = [d for d in dirs if d not in ignore_dirs]
         
         for filename in filenames:
-            # Ignorar apenas extensões binárias
-            ext = os.path.splitext(filename)[1].lower()
-            if ext in binary_extensions:
-                continue
-            
             filepath = os.path.join(root, filename)
             relative_path = os.path.relpath(filepath, project_root)
             
             try:
-                # Tentar ler como texto
-                with open(filepath, 'r', encoding='utf-8') as f:
-                    content = f.read()
+                size = os.path.getsize(filepath)
+                if size > MAX_FILE_SIZE:
+                    logger.warning(f"Arquivo ignorado (muito grande): {relative_path} ({size} bytes)")
+                    continue
                 
-                files.append({
-                    "path": relative_path,
-                    "content": content
-                })
-            except (UnicodeDecodeError, IOError):
-                # Arquivo binário ou não legível, pular
+                # Tentar ler como UTF-8 primeiro
+                try:
+                    with open(filepath, 'r', encoding='utf-8') as f:
+                        content = f.read()
+                    files.append({
+                        "path": relative_path,
+                        "content": content,
+                        "encoding": "utf-8"
+                    })
+                except UnicodeDecodeError:
+                    # É binário - codifica como base64
+                    with open(filepath, 'rb') as f:
+                        binary_content = f.read()
+                    files.append({
+                        "path": relative_path,
+                        "content": base64.b64encode(binary_content).decode('ascii'),
+                        "encoding": "base64"
+                    })
+            except (IOError, OSError) as e:
+                logger.warning(f"Arquivo não legível {relative_path}: {e}")
                 continue
     
     return files
 
 
+# Armazenamento em memória dos jobs de push (em produção usar Redis)
+github_push_jobs: Dict[str, Dict] = {}
+
+
+def _run_push_job(job_id: str, access_token: str, repo_name: str, commit_message: str, branch: Optional[str]):
+    """Executa o push em background e atualiza o status do job"""
+    try:
+        github_push_jobs[job_id]["status"] = "scanning"
+        github_push_jobs[job_id]["message"] = "Escaneando arquivos do projeto..."
+        
+        files = get_project_files()
+        total = len(files)
+        github_push_jobs[job_id]["total_files"] = total
+        github_push_jobs[job_id]["status"] = "uploading"
+        github_push_jobs[job_id]["message"] = f"Enviando {total} arquivos..."
+        
+        logger.info(f"[Job {job_id}] Enviando {total} arquivos para {repo_name}")
+        
+        if total == 0:
+            github_push_jobs[job_id]["status"] = "error"
+            github_push_jobs[job_id]["error"] = "Nenhum arquivo encontrado"
+            return
+        
+        def progress(step: str, current: int, total: int):
+            github_push_jobs[job_id]["step"] = step
+            github_push_jobs[job_id]["progress"] = current
+            github_push_jobs[job_id]["total_files"] = total
+        
+        service = GitHubService(access_token)
+        result = service.push_bulk_via_tree(
+            repo_name=repo_name,
+            files=files,
+            commit_message=commit_message,
+            branch=branch,
+            progress_callback=progress
+        )
+        
+        if result["success"]:
+            github_push_jobs[job_id]["status"] = "completed"
+            github_push_jobs[job_id]["files_pushed"] = result["files_pushed"]
+            github_push_jobs[job_id]["commit_url"] = result.get("commit_url")
+            github_push_jobs[job_id]["message"] = f"Sucesso! {result['files_pushed']} arquivos enviados"
+            logger.info(f"[Job {job_id}] Concluído: {result['files_pushed']} arquivos")
+        else:
+            github_push_jobs[job_id]["status"] = "error"
+            github_push_jobs[job_id]["error"] = result.get("error", "Erro desconhecido")
+            logger.error(f"[Job {job_id}] Falhou: {result.get('error')}")
+    except Exception as e:
+        logger.exception(f"[Job {job_id}] Exceção: {e}")
+        github_push_jobs[job_id]["status"] = "error"
+        github_push_jobs[job_id]["error"] = str(e)
+
+
 @api_router.post("/github/push-project")
-async def push_entire_project(request: GitHubPushProjectRequest, session_id: str):
+async def push_entire_project(
+    request: GitHubPushProjectRequest,
+    session_id: str,
+    background_tasks: BackgroundTasks
+):
     """
-    Envia TODOS os arquivos do projeto para o repositório GitHub
-    Similar ao "Save to GitHub" da plataforma Emergent
+    Inicia o envio assíncrono de TODOS os arquivos do projeto ao GitHub.
+    Usa Git Tree API (1 commit atômico) para ser rápido.
+    Retorna imediatamente um job_id para polling de status.
     """
     session = github_sessions.get(session_id)
     if not session:
         raise HTTPException(status_code=401, detail="Sessão não encontrada")
     
-    try:
-        logger.info(f"Iniciando push do projeto completo para {request.repo_name}")
-        
-        # Obter todos os arquivos do projeto
-        files = get_project_files()
-        logger.info(f"Encontrados {len(files)} arquivos para enviar")
-        
-        if not files:
-            raise HTTPException(status_code=400, detail="Nenhum arquivo encontrado no projeto")
-        
-        service = GitHubService(session["access_token"])
-        
-        # Enviar arquivos em lotes para evitar rate limiting
-        batch_size = 10  # Aumentado de 5 para 10
-        total_success = 0
-        total_errors = []
-        
-        for i in range(0, len(files), batch_size):
-            batch = files[i:i + batch_size]
-            
-            for file_info in batch:
-                try:
-                    result = service.push_file(
-                        repo_name=request.repo_name,
-                        file_path=file_info["path"],
-                        content=file_info["content"],
-                        commit_message=f"{request.commit_message} - {file_info['path']}",
-                        branch=request.branch
-                    )
-                    
-                    if result["success"]:
-                        total_success += 1
-                        logger.info(f"✓ Enviado: {file_info['path']}")
-                    else:
-                        total_errors.append({"path": file_info["path"], "error": result.get("error", "Unknown error")})
-                        logger.warning(f"✗ Erro em {file_info['path']}: {result.get('error')}")
-                        
-                except Exception as e:
-                    total_errors.append({"path": file_info["path"], "error": str(e)})
-                    logger.error(f"✗ Exceção em {file_info['path']}: {e}")
-            
-            # Pequena pausa entre lotes para evitar rate limiting (reduzido)
-            import asyncio
-            await asyncio.sleep(0.2)
-        
-        logger.info(f"Push concluído: {total_success} sucesso, {len(total_errors)} erros")
-        
-        return {
-            "success": len(total_errors) == 0,
-            "total_files": len(files),
-            "files_pushed": total_success,
-            "errors": total_errors[:10],  # Limitar erros retornados
-            "message": f"Projeto enviado: {total_success}/{len(files)} arquivos"
-        }
-        
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.error(f"Erro ao enviar projeto: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
+    job_id = str(uuid.uuid4())
+    github_push_jobs[job_id] = {
+        "job_id": job_id,
+        "status": "queued",
+        "message": "Enfileirado...",
+        "repo_name": request.repo_name,
+        "created_at": datetime.now(timezone.utc).isoformat(),
+        "total_files": 0,
+        "files_pushed": 0,
+        "progress": 0
+    }
+    
+    background_tasks.add_task(
+        _run_push_job,
+        job_id,
+        session["access_token"],
+        request.repo_name,
+        request.commit_message,
+        request.branch
+    )
+    
+    return {"job_id": job_id, "status": "queued"}
+
+
+@api_router.get("/github/push-project/status/{job_id}")
+async def get_push_job_status(job_id: str):
+    """Retorna o status atual de um job de push"""
+    job = github_push_jobs.get(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="Job não encontrado")
+    return job
 
 
 # Include the router in the main app

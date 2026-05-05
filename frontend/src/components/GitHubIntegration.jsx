@@ -227,53 +227,89 @@ export const GitHubIntegration = ({ isOpen, onClose }) => {
         setPushing(true);
         setSelectedRepo(repoName);
         
+        const loadingToastId = toast.loading("Preparando envio...", {
+            description: "Iniciando push do projeto",
+        });
+        
         try {
-            toast.info("Enviando projeto...", {
-                description: "Isso pode levar alguns minutos. Por favor, aguarde.",
-                duration: 120000
-            });
-            
-            const controller = new AbortController();
-            const timeoutId = setTimeout(() => controller.abort(), 300000);
-            
-            const response = await fetch(`${BACKEND_URL}/api/github/push-project?session_id=${sessionId}`, {
+            // 1) Iniciar job de push assíncrono
+            const startResponse = await fetch(`${BACKEND_URL}/api/github/push-project?session_id=${sessionId}`, {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify({
                     repo_name: repoName,
                     commit_message: `Atualização via Help Invest - ${new Date().toLocaleString('pt-BR')}`
-                }),
-                signal: controller.signal
+                })
             });
             
-            clearTimeout(timeoutId);
-            
-            // Ler resposta apenas uma vez
-            const text = await response.text();
-            let data;
-            try {
-                data = JSON.parse(text);
-            } catch {
-                data = { success: false, error: text };
+            if (!startResponse.ok) {
+                const errData = await startResponse.json().catch(() => ({}));
+                throw new Error(errData.detail || "Erro ao iniciar push");
             }
             
-            if (response.ok && (data.success || data.files_pushed > 0)) {
-                toast.success("Projeto salvo no GitHub!", {
-                    description: `${data.files_pushed}/${data.total_files} arquivos enviados`
+            const { job_id } = await startResponse.json();
+            
+            // 2) Polling do status
+            const pollStatus = async () => {
+                const statusResp = await fetch(`${BACKEND_URL}/api/github/push-project/status/${job_id}`);
+                if (!statusResp.ok) {
+                    throw new Error("Erro ao consultar status");
+                }
+                return await statusResp.json();
+            };
+            
+            let attempts = 0;
+            const MAX_ATTEMPTS = 180; // 180 * 3s = 9 minutos
+            
+            while (attempts < MAX_ATTEMPTS) {
+                await new Promise(r => setTimeout(r, 3000));
+                attempts++;
+                
+                const job = await pollStatus();
+                
+                // Atualizar toast com progresso
+                const progressText = job.total_files > 0 
+                    ? `${job.progress || 0}/${job.total_files} arquivos`
+                    : job.message || "Processando...";
+                
+                toast.loading(`Salvando no GitHub...`, {
+                    id: loadingToastId,
+                    description: progressText
                 });
-            } else {
-                toast.error("Erro ao salvar", { 
-                    description: data.error || data.detail || "Erro desconhecido"
-                });
+                
+                if (job.status === "completed") {
+                    toast.success("Projeto salvo no GitHub!", {
+                        id: loadingToastId,
+                        description: `${job.files_pushed} arquivos enviados em um único commit`,
+                        duration: 6000,
+                        action: job.commit_url ? {
+                            label: "Ver commit",
+                            onClick: () => window.open(job.commit_url, '_blank')
+                        } : undefined
+                    });
+                    return;
+                }
+                
+                if (job.status === "error") {
+                    toast.error("Erro ao salvar no GitHub", {
+                        id: loadingToastId,
+                        description: job.error || "Erro desconhecido"
+                    });
+                    return;
+                }
             }
+            
+            // Timeout de polling
+            toast.warning("Envio demorando mais que o esperado", {
+                id: loadingToastId,
+                description: "Verifique seu repositório no GitHub em alguns minutos."
+            });
         } catch (error) {
-            if (error.name === 'AbortError') {
-                toast.warning("Envio em andamento", {
-                    description: "Verifique seu repositório no GitHub em alguns minutos."
-                });
-            } else {
-                toast.error("Erro ao salvar no GitHub");
-            }
+            console.error("Erro no push:", error);
+            toast.error("Erro ao salvar no GitHub", {
+                id: loadingToastId,
+                description: error.message || "Erro desconhecido"
+            });
         } finally {
             setPushing(false);
             setSelectedRepo(null);
