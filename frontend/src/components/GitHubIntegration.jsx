@@ -230,14 +230,12 @@ export const GitHubIntegration = ({ isOpen, onClose }) => {
         try {
             toast.info("Enviando projeto...", {
                 description: "Isso pode levar alguns minutos. Por favor, aguarde.",
-                duration: 120000  // 2 minutos
+                duration: 120000
             });
             
-            // Criar AbortController com timeout maior
             const controller = new AbortController();
-            const timeoutId = setTimeout(() => controller.abort(), 300000); // 5 minutos timeout
+            const timeoutId = setTimeout(() => controller.abort(), 300000);
             
-            // Enviar TODOS os arquivos do projeto
             const response = await fetch(`${BACKEND_URL}/api/github/push-project?session_id=${sessionId}`, {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
@@ -250,27 +248,31 @@ export const GitHubIntegration = ({ isOpen, onClose }) => {
             
             clearTimeout(timeoutId);
             
-            const data = await response.json();
+            // Ler resposta apenas uma vez
+            const text = await response.text();
+            let data;
+            try {
+                data = JSON.parse(text);
+            } catch {
+                data = { success: false, error: text };
+            }
             
-            if (data.success || data.files_pushed > 0) {
+            if (response.ok && (data.success || data.files_pushed > 0)) {
                 toast.success("Projeto salvo no GitHub!", {
-                    description: `${data.files_pushed}/${data.total_files} arquivos enviados para ${repoName}`
+                    description: `${data.files_pushed}/${data.total_files} arquivos enviados`
                 });
             } else {
                 toast.error("Erro ao salvar", { 
-                    description: data.errors?.[0]?.error || data.detail || "Erro desconhecido"
+                    description: data.error || data.detail || "Erro desconhecido"
                 });
             }
         } catch (error) {
-            console.error("Erro ao fazer push:", error);
             if (error.name === 'AbortError') {
-                toast.warning("O envio está demorando mais que o esperado", {
-                    description: "Os arquivos continuam sendo enviados em background. Verifique seu repositório no GitHub em alguns minutos."
+                toast.warning("Envio em andamento", {
+                    description: "Verifique seu repositório no GitHub em alguns minutos."
                 });
             } else {
-                toast.error("Erro ao salvar no GitHub", {
-                    description: error.message || "Tente novamente"
-                });
+                toast.error("Erro ao salvar no GitHub");
             }
         } finally {
             setPushing(false);
