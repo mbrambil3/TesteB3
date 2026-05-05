@@ -229,8 +229,13 @@ export const GitHubIntegration = ({ isOpen, onClose }) => {
         
         try {
             toast.info("Enviando projeto...", {
-                description: "Isso pode levar alguns segundos"
+                description: "Isso pode levar alguns minutos. Por favor, aguarde.",
+                duration: 120000  // 2 minutos
             });
+            
+            // Criar AbortController com timeout maior
+            const controller = new AbortController();
+            const timeoutId = setTimeout(() => controller.abort(), 300000); // 5 minutos timeout
             
             // Enviar TODOS os arquivos do projeto
             const response = await fetch(`${BACKEND_URL}/api/github/push-project?session_id=${sessionId}`, {
@@ -239,8 +244,11 @@ export const GitHubIntegration = ({ isOpen, onClose }) => {
                 body: JSON.stringify({
                     repo_name: repoName,
                     commit_message: `Atualização via Help Invest - ${new Date().toLocaleString('pt-BR')}`
-                })
+                }),
+                signal: controller.signal
             });
+            
+            clearTimeout(timeoutId);
             
             const data = await response.json();
             
@@ -255,7 +263,15 @@ export const GitHubIntegration = ({ isOpen, onClose }) => {
             }
         } catch (error) {
             console.error("Erro ao fazer push:", error);
-            toast.error("Erro ao salvar no GitHub");
+            if (error.name === 'AbortError') {
+                toast.warning("O envio está demorando mais que o esperado", {
+                    description: "Os arquivos continuam sendo enviados em background. Verifique seu repositório no GitHub em alguns minutos."
+                });
+            } else {
+                toast.error("Erro ao salvar no GitHub", {
+                    description: error.message || "Tente novamente"
+                });
+            }
         } finally {
             setPushing(false);
             setSelectedRepo(null);
