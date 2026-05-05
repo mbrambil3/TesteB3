@@ -1004,54 +1004,39 @@ class GitHubPushProjectRequest(BaseModel):
 
 def get_project_files() -> List[Dict[str, str]]:
     """
-    Lê todos os arquivos do projeto para enviar ao GitHub
-    Exclui arquivos de sistema, cache, node_modules, etc.
+    Lê TODOS os arquivos do projeto para enviar ao GitHub
+    Exclui apenas diretórios de sistema/cache que não fazem parte do projeto
     """
     import os
-    import base64
     
     project_root = "/app"
     files = []
     
-    # Diretórios e arquivos a ignorar
+    # APENAS diretórios de sistema/cache a ignorar (não fazem parte do projeto)
     ignore_dirs = {
         'node_modules', '__pycache__', '.git', '.emergent', 'venv', '.venv',
-        'dist', 'build', '.next', 'coverage', '.pytest_cache', '.mypy_cache',
-        'logs', 'tmp', 'temp', '.cache', 'memory'
+        '.pytest_cache', '.mypy_cache', '.ruff_cache', '.cache'
     }
     
-    ignore_files = {
-        '.DS_Store', 'Thumbs.db', '.env.local', '.env.development.local',
-        '.env.test.local', '.env.production.local', '*.pyc', '*.pyo',
-        '*.log', '*.lock', 'yarn.lock', 'package-lock.json'
-    }
-    
-    # Extensões binárias (não enviar)
+    # Extensões binárias (não podem ser enviadas como texto)
     binary_extensions = {
-        '.png', '.jpg', '.jpeg', '.gif', '.ico', '.svg', '.webp',
-        '.mp3', '.mp4', '.wav', '.avi', '.mov',
+        '.png', '.jpg', '.jpeg', '.gif', '.ico', '.svg', '.webp', '.bmp',
+        '.mp3', '.mp4', '.wav', '.avi', '.mov', '.webm',
         '.zip', '.tar', '.gz', '.rar', '.7z',
         '.exe', '.dll', '.so', '.dylib',
-        '.pdf', '.doc', '.docx', '.xls', '.xlsx',
-        '.ttf', '.woff', '.woff2', '.eot', '.otf'
+        '.pdf', '.doc', '.docx', '.xls', '.xlsx', '.ppt', '.pptx',
+        '.ttf', '.woff', '.woff2', '.eot', '.otf',
+        '.pyc', '.pyo', '.class', '.o'
     }
     
     for root, dirs, filenames in os.walk(project_root):
-        # Filtrar diretórios ignorados
-        dirs[:] = [d for d in dirs if d not in ignore_dirs and not d.startswith('.')]
+        # Filtrar apenas diretórios de sistema
+        dirs[:] = [d for d in dirs if d not in ignore_dirs]
         
         for filename in filenames:
-            # Ignorar arquivos específicos
-            if filename in ignore_files or filename.startswith('.'):
-                continue
-            
-            # Ignorar extensões binárias
+            # Ignorar apenas extensões binárias
             ext = os.path.splitext(filename)[1].lower()
             if ext in binary_extensions:
-                continue
-            
-            # Ignorar padrões com wildcard
-            if any(filename.endswith(pattern.replace('*', '')) for pattern in ignore_files if '*' in pattern):
                 continue
             
             filepath = os.path.join(root, filename)
@@ -1096,7 +1081,7 @@ async def push_entire_project(request: GitHubPushProjectRequest, session_id: str
         service = GitHubService(session["access_token"])
         
         # Enviar arquivos em lotes para evitar rate limiting
-        batch_size = 5
+        batch_size = 10  # Aumentado de 5 para 10
         total_success = 0
         total_errors = []
         
@@ -1124,9 +1109,9 @@ async def push_entire_project(request: GitHubPushProjectRequest, session_id: str
                     total_errors.append({"path": file_info["path"], "error": str(e)})
                     logger.error(f"✗ Exceção em {file_info['path']}: {e}")
             
-            # Pequena pausa entre lotes para evitar rate limiting
+            # Pequena pausa entre lotes para evitar rate limiting (reduzido)
             import asyncio
-            await asyncio.sleep(0.5)
+            await asyncio.sleep(0.2)
         
         logger.info(f"Push concluído: {total_success} sucesso, {len(total_errors)} erros")
         
